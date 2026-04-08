@@ -1,54 +1,8 @@
-"""
-Subtitle Worker (S3 version)
-Pop task → download chunk results from S3 → merge → generate SRT/VTT → burn → upload to S3 → push completion.
-"""
-import os
-import json
-import tempfile
-from app.Config import config
-from app import Redis_client as rc
-from app import S3_client as s3
-from app.Generator import (
-    merge_transcript,
-    generate_srt,
-    generate_vtt,
-    save_transcript,
-    format_timestamp_srt,
-)
-from app.Burner import burn_subtitles
-
-
-def load_chunk_results_from_s3(job_id: str) -> list[dict]:
-    """Load all chunk JSON results from S3 and merge into a single timeline."""
-    prefix = f"results/{job_id}/chunk_"
-    files = s3.list_files(prefix)
-
-    if not files:
-        raise RuntimeError(f"No chunk results found in S3 for job {job_id}")
-
-    # Sort by key name (chunk_0000.json, chunk_0001.json, ...)
-    files = sorted(files, key=lambda f: f["key"])
-
-    all_segments = []
-    for file_info in files:
-        if not file_info["key"].endswith(".json"):
-            continue
-
-        data_str = s3.download_json(file_info["key"])
-        data = json.loads(data_str)
-
-        segments = data.get("segments", [])
-        if not segments and data.get("text"):
-            segments = [{"start": 0.0, "end": 0.0, "text": data["text"]}]
-
-        all_segments.extend(segments)
-
-    return all_segments
-
 
 async def process_task(message: dict):
     task_id = message["task_id"]
     job_id = message["job_id"]
+    user_id = message.get("user_id", 0)
     original_video = message["original_video"]
     subtitle_format = message.get("format", "srt")
     burn = message.get("burn", False)
@@ -68,17 +22,18 @@ async def process_task(message: dict):
             save_transcript(transcript, local_transcript)
             transcript_key = f"results/{job_id}/transcript.json"
             s3.upload_file(local_transcript, transcript_key)
+            await register_file(job_id, user_id, "transcript", "json", transcript_key, "application/json")
 
             outputs = {"transcript": transcript_key}
 
             # Step 3: Generate subtitle files
-            srt_key = None
             if subtitle_format in ("srt", "both"):
                 local_srt = os.path.join(tmp_dir, "subtitles.srt")
                 generate_srt(segments, local_srt)
                 srt_key = f"results/{job_id}/subtitles.srt"
                 s3.upload_file(local_srt, srt_key)
                 outputs["srt"] = srt_key
+                await register_file(job_id, user_id, "subtitle", "srt", srt_key, "application/x-subrip")
                 print(f"  [SUBTITLE] Generated and uploaded SRT")
 
             if subtitle_format in ("vtt", "both"):
@@ -87,28 +42,26 @@ async def process_task(message: dict):
                 vtt_key = f"results/{job_id}/subtitles.vtt"
                 s3.upload_file(local_vtt, vtt_key)
                 outputs["vtt"] = vtt_key
+                await register_file(job_id, user_id, "subtitle", "vtt", vtt_key, "text/vtt")
                 print(f"  [SUBTITLE] Generated and uploaded VTT")
 
             # Step 4: Burn subtitles onto video (if requested)
             if burn:
-                # Download original video
                 local_video = os.path.join(tmp_dir, "video.mp4")
                 s3.download_file(original_video, local_video)
 
-                # Need SRT for burning
                 local_srt_for_burn = os.path.join(tmp_dir, "subtitles.srt")
                 if not os.path.exists(local_srt_for_burn):
                     generate_srt(segments, local_srt_for_burn)
 
-                # Burn
                 local_output = os.path.join(tmp_dir, "video_subtitled.mp4")
                 print(f"  [SUBTITLE] Burning subtitles onto video...")
                 burn_subtitles(local_video, local_srt_for_burn, local_output)
 
-                # Upload burned video
                 video_key = f"results/{job_id}/video_subtitled.mp4"
                 s3.upload_file(local_output, video_key)
                 outputs["video"] = video_key
+                await register_file(job_id, user_id, "video", "mp4", video_key, "video/mp4")
                 print(f"  [SUBTITLE] Uploaded burned video")
 
             # Step 5: Push completion
@@ -131,5 +84,4 @@ async def process_task(message: dict):
             "status": "failed",
             "error": str(e),
         })
-
 
