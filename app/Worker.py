@@ -1,3 +1,73 @@
+"""
+Subtitle Worker (S3 version)
+Pop task -> download chunk results from S3 -> merge -> generate SRT/VTT -> burn -> upload to S3 -> register files -> push completion.
+"""
+import httpx
+import os
+import json
+import tempfile
+from app.Config import config
+from app import Redis_client as rc
+from app import S3_client as s3
+from app.Generator import (
+    merge_transcript,
+    generate_srt,
+    generate_vtt,
+    save_transcript,
+    format_timestamp_srt,
+)
+from app.Burner import burn_subtitles
+
+STORAGE_URL = os.environ.get("STORAGE_URL", "http://storage:8002")
+
+
+async def register_file(job_id, user_id, category, ftype, path, mime_type, size_bytes=0):
+    """Register an output file with the storage service."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{STORAGE_URL}/files/register",
+                json={
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "category": category,
+                    "type": ftype,
+                    "path": path,
+                    "mime_type": mime_type,
+                    "size_bytes": size_bytes,
+                },
+            )
+            print(f"  [SUBTITLE] Registered {ftype}: {path}")
+    except Exception as e:
+        print(f"  [SUBTITLE] register_file failed: {e}")
+
+
+def load_chunk_results_from_s3(job_id: str) -> list[dict]:
+    """Load all chunk JSON results from S3 and merge into a single timeline."""
+    prefix = f"results/{job_id}/chunk_"
+    files = s3.list_files(prefix)
+
+    if not files:
+        raise RuntimeError(f"No chunk results found in S3 for job {job_id}")
+
+    files = sorted(files, key=lambda f: f["key"])
+
+    all_segments = []
+    for file_info in files:
+        if not file_info["key"].endswith(".json"):
+            continue
+
+        data_str = s3.download_json(file_info["key"])
+        data = json.loads(data_str)
+
+        segments = data.get("segments", [])
+        if not segments and data.get("text"):
+            segments = [{"start": 0.0, "end": 0.0, "text": data["text"]}]
+
+        all_segments.extend(segments)
+
+    return all_segments
+
 
 async def process_task(message: dict):
     task_id = message["task_id"]
@@ -84,4 +154,3 @@ async def process_task(message: dict):
             "status": "failed",
             "error": str(e),
         })
-
