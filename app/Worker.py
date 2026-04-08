@@ -42,8 +42,19 @@ async def register_file(job_id, user_id, category, ftype, path, mime_type, size_
         print(f"  [SUBTITLE] register_file failed: {e}")
 
 
+import re
+
+CHUNK_DURATION = 30.0  # seconds per chunk (must match media worker)
+
+
+def _chunk_index_from_key(key: str) -> int:
+    """Extract chunk index from an S3 key like 'results/<job>/chunk_0042.json'."""
+    m = re.search(r"chunk_(\d+)", key)
+    return int(m.group(1)) if m else 0
+
+
 def load_chunk_results_from_s3(job_id: str) -> list[dict]:
-    """Load all chunk JSON results from S3 and merge into a single timeline."""
+    """Load all chunk JSON results from S3 and merge into a single absolute timeline."""
     prefix = f"results/{job_id}/chunk_"
     files = s3.list_files(prefix)
 
@@ -54,20 +65,31 @@ def load_chunk_results_from_s3(job_id: str) -> list[dict]:
 
     all_segments = []
     for file_info in files:
-        if not file_info["key"].endswith(".json"):
+        key = file_info["key"]
+        if not key.endswith(".json"):
             continue
 
-        data_str = s3.download_json(file_info["key"])
+        idx = _chunk_index_from_key(key)
+        offset = idx * CHUNK_DURATION
+
+        data_str = s3.download_json(key)
         data = json.loads(data_str)
 
         segments = data.get("segments", [])
         if not segments and data.get("text"):
-            segments = [{"start": 0.0, "end": 0.0, "text": data["text"]}]
+            segments = [{"start": 0.0, "end": CHUNK_DURATION, "text": data["text"]}]
 
-        all_segments.extend(segments)
+        for seg in segments:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0)) + offset
+            end = float(seg.get("end", CHUNK_DURATION)) + offset
+            if end <= start:
+                end = start + 0.5
+            all_segments.append({"start": start, "end": end, "text": text})
 
     return all_segments
-
 
 async def process_task(message: dict):
     task_id = message["task_id"]
