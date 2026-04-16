@@ -1,10 +1,12 @@
 """
 Subtitle Worker (S3 version)
 Pop task -> download chunk results from S3 -> merge -> generate SRT/VTT -> burn -> upload to S3 -> register files -> push completion.
+Uses chunks_meta.json for frame-accurate absolute timestamps instead of hardcoded chunk duration.
 """
 import httpx
 import os
 import json
+import re
 import tempfile
 from app.Config import config
 from app import Redis_client as rc
@@ -19,6 +21,7 @@ from app.Generator import (
 from app.Burner import burn_subtitles
 
 STORAGE_URL = os.environ.get("STORAGE_URL", "http://storage:8002")
+DEFAULT_FPS = 24.0
 
 
 async def register_file(job_id, user_id, category, ftype, path, mime_type, size_bytes=0):
@@ -42,19 +45,43 @@ async def register_file(job_id, user_id, category, ftype, path, mime_type, size_
         print(f"  [SUBTITLE] register_file failed: {e}")
 
 
-import re
-
-CHUNK_DURATION = 30.0  # seconds per chunk (must match media worker)
+def snap_to_frame(seconds: float, fps: float) -> float:
+    """Snap a timestamp to the nearest video frame boundary."""
+    frame = round(seconds * fps)
+    return frame / fps
 
 
 def _chunk_index_from_key(key: str) -> int:
-    """Extract chunk index from an S3 key like 'results/<job>/chunk_0042.json'."""
     m = re.search(r"chunk_(\d+)", key)
     return int(m.group(1)) if m else 0
 
 
+def load_chunks_meta(job_id: str) -> dict:
+    """
+    Load chunks_meta.json from S3.
+    Returns dict keyed by chunk_index with absolute_start, absolute_end, fps.
+    Falls back to empty dict if not found (backward compat).
+    """
+    meta_key = f"chunks/{job_id}/chunks_meta.json"
+    try:
+        data_str = s3.download_json(meta_key)
+        data = json.loads(data_str)
+        # Build lookup by chunk index
+        meta_by_index = {}
+        for chunk in data.get("chunks", []):
+            meta_by_index[chunk["chunk_index"]] = chunk
+        return meta_by_index, data.get("fps", DEFAULT_FPS)
+    except Exception as e:
+        print(f"  [SUBTITLE] chunks_meta.json not found, using fallback: {e}")
+        return {}, DEFAULT_FPS
+
+
 def load_chunk_results_from_s3(job_id: str) -> list[dict]:
-    """Load all chunk JSON results from S3 and merge into a single absolute timeline."""
+    """
+    Load all chunk JSON results from S3 and merge into a single absolute timeline.
+    Uses chunks_meta.json for precise frame-accurate offsets.
+    Falls back to index-based estimation if meta not available.
+    """
     prefix = f"results/{job_id}/chunk_"
     files = s3.list_files(prefix)
 
@@ -63,33 +90,52 @@ def load_chunk_results_from_s3(job_id: str) -> list[dict]:
 
     files = sorted(files, key=lambda f: f["key"])
 
+    # Load chunk metadata for accurate offsets
+    chunks_meta, fps = load_chunks_meta(job_id)
+
     all_segments = []
+    estimated_offset = 0.0  # fallback accumulator
+
     for file_info in files:
         key = file_info["key"]
         if not key.endswith(".json"):
             continue
 
         idx = _chunk_index_from_key(key)
-        offset = idx * CHUNK_DURATION
+
+        # Get absolute start from metadata if available
+        if idx in chunks_meta:
+            absolute_start = chunks_meta[idx]["absolute_start"]
+            chunk_duration = chunks_meta[idx]["duration"]
+        else:
+            # Fallback: accumulate from previous chunks
+            absolute_start = estimated_offset
+            chunk_duration = 30.0  # best guess fallback
 
         data_str = s3.download_json(key)
         data = json.loads(data_str)
 
         segments = data.get("segments", [])
         if not segments and data.get("text"):
-            segments = [{"start": 0.0, "end": CHUNK_DURATION, "text": data["text"]}]
+            segments = [{"start": 0.0, "end": chunk_duration, "text": data["text"]}]
 
         for seg in segments:
             text = (seg.get("text") or "").strip()
             if not text:
                 continue
-            start = float(seg.get("start", 0.0)) + offset
-            end = float(seg.get("end", CHUNK_DURATION)) + offset
+            # Add absolute offset and snap to frame
+            raw_start = float(seg.get("start", 0.0)) + absolute_start
+            raw_end = float(seg.get("end", chunk_duration)) + absolute_start
+            start = snap_to_frame(raw_start, fps)
+            end = snap_to_frame(raw_end, fps)
             if end <= start:
-                end = start + 0.5
+                end = snap_to_frame(start + (1.0 / fps), fps)
             all_segments.append({"start": start, "end": end, "text": text})
 
+        estimated_offset += chunk_duration
+
     return all_segments
+
 
 async def process_task(message: dict):
     task_id = message["task_id"]
