@@ -2,7 +2,13 @@
 Subtitle Worker (S3 version)
 Pop task → load single transcript JSON → snap timestamps to frame boundaries
 → generate SRT/VTT → burn → upload to S3 → register files → push completion.
-Uses video_meta.json for fps to produce frame-accurate subtitle timestamps.
+
+Pushes TWO completion messages when burn is requested:
+  1. stage="subtitles" after SRT/VTT/transcript are uploaded & registered
+  2. stage="burn" after burned video is uploaded & registered
+
+When burn is NOT requested, only the subtitles completion is sent (with
+final=True so the orchestrator marks the job completed).
 """
 import httpx
 import os
@@ -98,22 +104,22 @@ async def process_task(message: dict):
     subtitle_format = message.get("format", "srt")
     burn = message.get("burn", False)
 
-    print(f"  [SUBTITLE] Processing job {job_id}")
+    print(f"  [SUBTITLE] Processing job {job_id} (burn={burn})")
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            # Step 1: Load video metadata for fps
+            # ─── Step 1: Load video metadata for fps ────────────────────
             meta = load_video_meta(job_id)
             fps = meta.get("fps", DEFAULT_FPS)
             print(f"  [SUBTITLE] Using fps={fps:.3f} for frame-accurate timestamps")
 
-            # Step 2: Load transcript and snap timestamps to frame boundaries
+            # ─── Step 2: Load transcript and snap timestamps ────────────
             print(f"  [SUBTITLE] Loading transcript from S3...")
             segments = load_transcript_from_s3(job_id, fps)
             transcript = merge_transcript(segments)
             print(f"  [SUBTITLE] Loaded {len(segments)} segments")
 
-            # Step 3: Save and upload transcript
+            # ─── Step 3: Save and upload transcript ─────────────────────
             local_transcript = os.path.join(tmp_dir, "transcript.json")
             save_transcript(transcript, local_transcript)
             transcript_key = f"results/{job_id}/transcript.json"
@@ -122,7 +128,7 @@ async def process_task(message: dict):
 
             outputs = {"transcript": transcript_key}
 
-            # Step 4: Generate subtitle files
+            # ─── Step 4: Generate subtitle files ────────────────────────
             if subtitle_format in ("srt", "both"):
                 local_srt = os.path.join(tmp_dir, "subtitles.srt")
                 generate_srt(segments, local_srt)
@@ -141,7 +147,22 @@ async def process_task(message: dict):
                 await register_file(job_id, user_id, "subtitle", "vtt", vtt_key, "text/vtt")
                 print(f"  [SUBTITLE] Generated and uploaded VTT")
 
-            # Step 5: Burn subtitles onto video (if requested)
+            # ─── Step 5: Push FIRST completion (subtitles done) ─────────
+            # If burn is NOT requested, this is the final message.
+            # If burn IS requested, the orchestrator will move job to "burning"
+            # and wait for the second completion.
+            await rc.push_completed({
+                "task_id": task_id,
+                "job_id": job_id,
+                "type": "subtitle",
+                "stage": "subtitles",
+                "status": "completed",
+                "final": not burn,
+                "outputs": outputs,
+            })
+            print(f"  [SUBTITLE] Pushed subtitles-stage completion for job {job_id}")
+
+            # ─── Step 6: Burn subtitles onto video (if requested) ───────
             if burn:
                 local_video = os.path.join(tmp_dir, "video.mp4")
                 s3.download_file(original_video, local_video)
@@ -156,18 +177,20 @@ async def process_task(message: dict):
 
                 video_key = f"results/{job_id}/video_subtitled.mp4"
                 s3.upload_file(local_output, video_key)
-                outputs["video"] = video_key
                 await register_file(job_id, user_id, "video", "mp4", video_key, "video/mp4")
                 print(f"  [SUBTITLE] Uploaded burned video")
 
-            # Step 6: Push completion
-            await rc.push_completed({
-                "task_id": task_id,
-                "job_id": job_id,
-                "type": "subtitle",
-                "status": "completed",
-                "outputs": outputs,
-            })
+                # ─── Step 7: Push SECOND completion (burn done) ─────────
+                await rc.push_completed({
+                    "task_id": task_id,
+                    "job_id": job_id,
+                    "type": "subtitle",
+                    "stage": "burn",
+                    "status": "completed",
+                    "final": True,
+                    "outputs": {"video": video_key},
+                })
+                print(f"  [SUBTITLE] Pushed burn-stage completion for job {job_id}")
 
             print(f"  [SUBTITLE] Job {job_id} done")
 
@@ -177,6 +200,8 @@ async def process_task(message: dict):
             "task_id": task_id,
             "job_id": job_id,
             "type": "subtitle",
+            "stage": "burn" if burn else "subtitles",
             "status": "failed",
+            "final": True,
             "error": str(e),
         })
