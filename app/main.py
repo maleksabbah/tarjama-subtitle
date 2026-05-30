@@ -1,38 +1,57 @@
+# subtitle: app/main.py
 """
-ASR Subtitle Service
-=====================
-Merges chunk transcriptions into SRT/VTT files and optionally burns onto video.
-Runs as a background worker — no HTTP server.
-
-Run:
-  python -m app.main
+Subtitle worker entrypoint.
+Builds Kafka, S3, Storage HTTP, processing, worker. Runs the consume loop.
 """
 import asyncio
-from app import Redis_client as rc
-from app.Worker import process_task
+
+import httpx
+
+from app.Config.Config import config
+from app.Config.Kafka import get_producer, make_consumer, close_producer
+from app.Repositories import (
+    EventConsumer,
+    EventPublisher,
+    S3Client,
+    StorageClient,
+)
+from app.Services import SubtitleProcessingService, SubtitleWorkerService
 
 
-async def main():
+async def main() -> None:
     print("Starting Subtitle Service...")
-    await rc.init_redis()
-    print("  Redis connected")
-    print("Subtitle Service ready. Waiting for tasks...")
 
+    producer = await get_producer()
+    publisher = EventPublisher(producer)
+
+    consumer = EventConsumer(
+        make_consumer(
+            topics=[config.TOPIC_SUBTITLE_TASKS],
+            group_id=config.GROUP_SUBTITLE_WORKER,
+        )
+    )
+
+    s3 = S3Client()
+    http_client = httpx.AsyncClient(timeout=10.0)
+    storage = StorageClient(http_client)
+    processing = SubtitleProcessingService()
+
+    worker = SubtitleWorkerService(
+        consumer=consumer,
+        publisher=publisher,
+        s3=s3,
+        storage=storage,
+        processing=processing,
+    )
+
+    print("Subtitle Service ready.")
     try:
-        while True:
-            try:
-                message = await rc.pop_subtitle_task(timeout=5)
-                if message:
-                    print(f"  [SUBTITLE] Received task for job {message.get('job_id')}")
-                    await process_task(message)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"  [SUBTITLE] Error: {e}")
-                await asyncio.sleep(1)
+        await worker.run()
+    except KeyboardInterrupt:
+        pass
     finally:
-        print("Shutting down Subtitle Service...")
-        await rc.close_redis()
+        await http_client.aclose()
+        await close_producer()
         print("Subtitle Service stopped.")
 
 
