@@ -83,12 +83,12 @@ class SubtitleWorkerService:
             segments = self.processing.snap_segments(
                 raw_segments, fps, duration=duration,
             )
-            transcript = self.processing.merge_transcript(segments)
+            transcript = self.processing.merge_transcripts(segments)
             print(f"  [SUBTITLE] {len(segments)} segments")
 
             # 3. Save and upload transcript
             local_transcript = os.path.join(tmp_dir, "transcript.json")
-            self.processing.save_transcript(transcript, local_transcript)
+            self.processing.save_transcripts(transcript, local_transcript)
             transcript_key = f"results/{job_id}/transcript.json"
             self.s3.upload_file(local_transcript, transcript_key)
             await self.storage.register_file(
