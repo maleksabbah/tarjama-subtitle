@@ -19,7 +19,6 @@ async def get_producer() -> AIOKafkaProducer:
             bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=lambda v: v.encode("utf-8") if isinstance(v, str) else v,
             acks="all",
-            enable_idempotence=True,
             compression_type="gzip",
         )
         await _producer.start()
